@@ -1,0 +1,5 @@
+__pycache__
+.idea
+hdf/*
+logs/*
+constants.py
