@@ -1,3 +1,6 @@
+from comet_ml import Experiment
+from constants import API_KEY
+
 import argparse
 import os
 import time
@@ -20,16 +23,21 @@ from data.utils import crop_targets, random_amplify
 from test import evaluate, validate
 from model.waveunet import Waveunet
 
+
 def main(args):
-    #torch.backends.cudnn.benchmark=True # This makes dilated conv much faster for CuDNN 7.5
+    # torch.backends.cudnn.benchmark=True # This makes dilated conv much faster for CuDNN 7.5
+    experiment = Experiment(project_name='Wave-U-Net', api_key=API_KEY, disabled=not args.comet)
 
     # MODEL
-    num_features = [args.features*i for i in range(1, args.levels+1)] if args.feature_growth == "add" else \
-                   [args.features*2**i for i in range(0, args.levels)]
+    num_features = [args.features * i for i in range(1, args.levels + 1)] if args.feature_growth == "add" else \
+        [args.features * 2 ** i for i in range(0, args.levels)]
+    print(num_features)
     target_outputs = int(args.output_size * args.sr)
+    print(target_outputs)
     model = Waveunet(args.channels, num_features, args.channels, args.instruments, kernel_size=args.kernel_size,
                      target_output_size=target_outputs, depth=args.depth, strides=args.strides,
                      conv_type=args.conv_type, res=args.res, separate=args.separate)
+    print(model)
 
     if args.cuda:
         model = model_utils.DataParallel(model)
@@ -47,11 +55,15 @@ def main(args):
     crop_func = partial(crop_targets, shapes=model.shapes)
     # Data augmentation function for training
     augment_func = partial(random_amplify, shapes=model.shapes, min=0.7, max=1.0)
-    train_data = SeparationDataset(musdb, "train", args.instruments, args.sr, args.channels, model.shapes, True, args.hdf_dir, audio_transform=augment_func)
-    val_data = SeparationDataset(musdb, "val", args.instruments, args.sr, args.channels, model.shapes, False, args.hdf_dir, audio_transform=crop_func)
-    test_data = SeparationDataset(musdb, "test", args.instruments, args.sr, args.channels, model.shapes, False, args.hdf_dir, audio_transform=crop_func)
+    train_data = SeparationDataset(musdb, "train", args.instruments, args.sr, args.channels, model.shapes, True,
+                                   args.hdf_dir, audio_transform=augment_func)
+    val_data = SeparationDataset(musdb, "val", args.instruments, args.sr, args.channels, model.shapes, False,
+                                 args.hdf_dir, audio_transform=crop_func)
+    test_data = SeparationDataset(musdb, "test", args.instruments, args.sr, args.channels, model.shapes, False,
+                                  args.hdf_dir, audio_transform=crop_func)
 
-    dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, worker_init_fn=utils.worker_init_fn)
+    dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
+                                             num_workers=args.num_workers, worker_init_fn=utils.worker_init_fn)
 
     ##### TRAINING ####
 
@@ -67,10 +79,10 @@ def main(args):
     optimizer = Adam(params=model.parameters(), lr=args.lr)
 
     # Set up training state dict that will also be saved into checkpoints
-    state = {"step" : 0,
-             "worse_epochs" : 0,
-             "epochs" : 0,
-             "best_loss" : np.Inf}
+    state = {"step": 0,
+             "worse_epochs": 0,
+             "epochs": 0,
+             "best_loss": np.Inf}
 
     # LOAD MODEL CHECKPOINT IF DESIRED
     if args.load_model is not None:
@@ -93,8 +105,10 @@ def main(args):
                 t = time.time()
 
                 # Set LR for this iteration
-                utils.set_cyclic_lr(optimizer, example_num, len(train_data) // args.batch_size, args.cycles, args.min_lr, args.lr)
+                utils.set_cyclic_lr(optimizer, example_num, len(train_data) // args.batch_size, args.cycles,
+                                    args.min_lr, args.lr)
                 writer.add_scalar("lr", utils.get_lr(optimizer), state["step"])
+                experiment.log_metric("lr", utils.get_lr(optimizer), state["step"])
 
                 # Compute loss for each instrument/model
                 optimizer.zero_grad()
@@ -108,14 +122,22 @@ def main(args):
                 avg_time += (1. / float(example_num + 1)) * (t - avg_time)
 
                 writer.add_scalar("train_loss", avg_loss, state["step"])
+                experiment.log_metric("train_loss", avg_loss, state["step"])
 
                 if example_num % args.example_freq == 0:
-                    input_centre = torch.mean(x[0, :, model.shapes["output_start_frame"]:model.shapes["output_end_frame"]], 0) # Stereo not supported for logs yet
+                    input_centre = torch.mean(
+                        x[0, :, model.shapes["output_start_frame"]:model.shapes["output_end_frame"]],
+                        0)  # Stereo not supported for logs yet
                     writer.add_audio("input", input_centre, state["step"], sample_rate=args.sr)
+                    experiment.log_audio(input_centre, file_name="input", step=state["step"], sample_rate=args.sr)
 
                     for inst in outputs.keys():
-                        writer.add_audio(inst + "_pred", torch.mean(outputs[inst][0], 0), state["step"], sample_rate=args.sr)
-                        writer.add_audio(inst + "_target", torch.mean(targets[inst][0], 0), state["step"], sample_rate=args.sr)
+                        writer.add_audio(inst + "_pred", torch.mean(outputs[inst][0], 0), state["step"],
+                                         sample_rate=args.sr)
+                        experiment.log_audio(torch.mean(outputs[inst][0], 0), file_name="{}_pred".format(inst), step=state["step"], sample_rate=args.sr)
+                        writer.add_audio(inst + "_target", torch.mean(targets[inst][0], 0), state["step"],
+                                         sample_rate=args.sr)
+                        experiment.log_audio(torch.mean(targets[inst][0], 0), file_name="{}_target".format(inst), step=state["step"], sample_rate=args.sr)
 
                 pbar.update(1)
 
@@ -123,6 +145,7 @@ def main(args):
         val_loss = validate(args, model, criterion, val_data)
         print("VALIDATION FINISHED: LOSS: " + str(val_loss))
         writer.add_scalar("val_loss", val_loss, state["step"])
+        experiment.log_metric("val_loss", val_loss, state["step"])
 
         # EARLY STOPPING CHECK
         checkpoint_path = os.path.join(args.checkpoint_dir, "checkpoint_" + str(state["step"]))
@@ -138,7 +161,6 @@ def main(args):
         # CHECKPOINT
         print("Saving model...")
         model_utils.save_model(model, optimizer, state, checkpoint_path)
-
 
     #### TESTING ####
     # Test loss
@@ -158,8 +180,8 @@ def main(args):
         pickle.dump(test_metrics, f)
 
     # Write most important metrics into Tensorboard log
-    avg_SDRs = {inst : np.mean([np.nanmean(song[inst]["SDR"]) for song in test_metrics]) for inst in args.instruments}
-    avg_SIRs = {inst : np.mean([np.nanmean(song[inst]["SIR"]) for song in test_metrics]) for inst in args.instruments}
+    avg_SDRs = {inst: np.mean([np.nanmean(song[inst]["SDR"]) for song in test_metrics]) for inst in args.instruments}
+    avg_SIRs = {inst: np.mean([np.nanmean(song[inst]["SIR"]) for song in test_metrics]) for inst in args.instruments}
     for inst in args.instruments:
         writer.add_scalar("test_SDR_" + inst, avg_SDRs[inst], state["step"])
         writer.add_scalar("test_SIR_" + inst, avg_SIRs[inst], state["step"])
@@ -169,6 +191,7 @@ def main(args):
 
     writer.close()
 
+
 if __name__ == '__main__':
     ## TRAIN PARAMETERS
     parser = argparse.ArgumentParser()
@@ -176,6 +199,8 @@ if __name__ == '__main__':
                         help="List of instruments to separate (default: \"bass drums other vocals\")")
     parser.add_argument('--cuda', action='store_true',
                         help='Use CUDA (default: False)')
+    parser.add_argument('--comet', action='store_true',
+                        help='Use COMET (default: False)')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='Number of data loader worker threads (default: 1)')
     parser.add_argument('--features', type=int, default=32,
@@ -214,7 +239,7 @@ if __name__ == '__main__':
                         help="Strides in Waveunet")
     parser.add_argument('--patience', type=int, default=20,
                         help="Patience for early stopping on validation set")
-    parser.add_argument('--example_freq', type=int, default=200,
+    parser.add_argument('--example_freq', type=int, default=2000,
                         help="Write an audio summary into Tensorboard logs every X training iterations")
     parser.add_argument('--loss', type=str, default="L1",
                         help="L1 or L2")
@@ -222,9 +247,9 @@ if __name__ == '__main__':
                         help="Type of convolution (normal, BN-normalised, GN-normalised): normal/bn/gn")
     parser.add_argument('--res', type=str, default="fixed",
                         help="Resampling strategy: fixed sinc-based lowpass filtering or learned conv layer: fixed/learned")
-    parser.add_argument('--separate', type=int, default=1,
+    parser.add_argument('--separate', type=int, default=0,
                         help="Train separate model for each source (1) or only one (0)")
-    parser.add_argument('--feature_growth', type=str, default="double",
+    parser.add_argument('--feature_growth', type=str, default="add",
                         help="How the features in each layer should grow, either (add) the initial number of features each time, or multiply by 2 (double)")
 
     args = parser.parse_args()
