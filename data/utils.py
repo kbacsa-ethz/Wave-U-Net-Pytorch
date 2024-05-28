@@ -2,6 +2,7 @@ import librosa
 import numpy as np
 import soundfile
 import torch
+import pyarrow as pa
 
 
 def random_amplify(mix, targets, shapes, min, max):
@@ -66,3 +67,14 @@ def resample(audio, orig_sr, new_sr, mode="numpy"):
     if mode == "pytorch":
         out = torch.tensor(out)
     return out
+
+# Function to read raw data from a file
+def raw_reader(path):
+    with open(path, 'rb') as ff:
+        bin_data = ff.read()
+    return bin_data
+
+
+# Function to serialize an object using PyArrow
+def dumps_pyarrow(obj):
+    return pa.serialize(obj).to_buffer()

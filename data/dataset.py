@@ -1,16 +1,19 @@
 import os
 
 import h5py
+import lmdb
 import numpy as np
 from sortedcontainers import SortedList
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from data.utils import load
+from data.utils import load, dumps_pyarrow
+import pyarrow as pa
 
 
 class SeparationDataset(Dataset):
-    def __init__(self, dataset, partition, instruments, sr, channels, shapes, random_hops, hdf_dir, audio_transform=None, in_memory=False):
+    def __init__(self, dataset, partition, instruments, sr, channels, shapes, random_hops, hdf_dir,
+                 audio_transform=None, in_memory=False):
         '''
         Initialises a source separation dataset
         :param data: HDF audio data object
@@ -60,12 +63,13 @@ class SeparationDataset(Dataset):
                         source_audio, _ = load(example[source], sr=self.sr, mono=(self.channels == 1))
                         source_audios.append(source_audio)
                     source_audios = np.concatenate(source_audios, axis=0)
-                    assert(source_audios.shape[1] == mix_audio.shape[1])
+                    assert (source_audios.shape[1] == mix_audio.shape[1])
 
                     # Add to HDF5 file
                     grp = f.create_group(str(idx))
                     grp.create_dataset("inputs", shape=mix_audio.shape, dtype=mix_audio.dtype, data=mix_audio)
-                    grp.create_dataset("targets", shape=source_audios.shape, dtype=source_audios.dtype, data=source_audios)
+                    grp.create_dataset("targets", shape=source_audios.shape, dtype=source_audios.dtype,
+                                       data=source_audios)
                     grp.attrs["length"] = mix_audio.shape[1]
                     grp.attrs["target_length"] = source_audios.shape[1]
 
@@ -141,7 +145,151 @@ class SeparationDataset(Dataset):
         if pad_front > 0 or pad_back > 0:
             targets = np.pad(targets, [(0, 0), (pad_front, pad_back)], mode="constant", constant_values=0.0)
 
-        targets = {inst : targets[idx*self.channels:(idx+1)*self.channels] for idx, inst in enumerate(self.instruments)}
+        targets = {inst: targets[idx * self.channels:(idx + 1) * self.channels] for idx, inst in
+                   enumerate(self.instruments)}
+
+        if hasattr(self, "audio_transform") and self.audio_transform is not None:
+            audio, targets = self.audio_transform(audio, targets)
+
+        return audio, targets
+
+    def __len__(self):
+        return self.length
+
+
+class SeparationDatasetLMDB(Dataset):
+    def __init__(self, dataset, partition, instruments, sr, channels, shapes, random_hops, lmdb_dir,
+                 audio_transform=None, in_memory=False):
+        '''
+        Initialises a source separation dataset
+        :param data: HDF audio data object
+        :param input_size: Number of input samples for each example
+        :param context_front: Number of extra context samples to prepend to input
+        :param context_back: NUmber of extra context samples to append to input
+        :param hop_size: Skip hop_size - 1 sample positions in the audio for each example (subsampling the audio)
+        :param random_hops: If False, sample examples evenly from whole audio signal according to hop_size parameter. If True, randomly sample a position from the audio
+        '''
+
+        super(SeparationDatasetLMDB, self).__init__()
+
+        self.lmdb_dataset = None
+        os.makedirs(lmdb_dir, exist_ok=True)
+        # self.lmdb_dir = os.path.join(lmdb, partition + ".hdf5")
+        self.lmdb_dir = os.path.join(lmdb_dir, partition)
+
+        self.random_hops = random_hops
+        self.sr = sr
+        self.channels = channels
+        self.shapes = shapes
+        self.audio_transform = audio_transform
+        self.in_memory = in_memory
+        self.instruments = instruments
+
+        # PREPARE LMDB FILE
+
+        # Open LMDB database for the current phase
+
+        # Check if HDF file exists already
+        if not os.path.exists(self.lmdb_dir):
+            os.makedirs(self.lmdb_dir, exist_ok=True)
+            self.env = lmdb.open(self.lmdb_dir, subdir=True,
+                                 map_size=1099511627776,
+                                 readonly=False, meminit=False, map_async=True, writemap=False)
+            keys = []
+            with self.env.begin(write=True) as txn:
+
+                print("Adding audio files to dataset (preprocessing)...")
+                for idx, example in enumerate(tqdm(dataset[partition])):
+                    # Load mix
+                    mix_audio, _ = load(example["mix"], sr=self.sr, mono=(self.channels == 1))
+
+                    source_audios = []
+                    for source in instruments:
+                        # In this case, read in audio and convert to target sampling rate
+                        source_audio, _ = load(example[source], sr=self.sr, mono=(self.channels == 1))
+                        source_audios.append(source_audio)
+                    source_audios = np.concatenate(source_audios, axis=0)
+                    assert (source_audios.shape[1] == mix_audio.shape[1])
+
+                    keys.append(idx)
+                    txn.put(u'inputs_{}'.format(idx).encode('ascii'), dumps_pyarrow(mix_audio))
+                    txn.put(u'targets_{}'.format(idx).encode('ascii'), dumps_pyarrow(source_audios))
+                    txn.put(u'length_{}'.format(idx).encode('ascii'), dumps_pyarrow(mix_audio.shape[1]))
+                    txn.put(u'target_length_{}'.format(idx).encode('ascii'), dumps_pyarrow(source_audios.shape[1]))
+
+                txn.put(b'__sr__', dumps_pyarrow(sr))
+                txn.put(b'__channels__', dumps_pyarrow(channels))
+                txn.put(b'__instruments__', dumps_pyarrow(instruments))
+                txn.put(b'__keys__', dumps_pyarrow(keys))
+                txn.put(b'__len__', dumps_pyarrow(len(keys)))
+
+            print("Flushing database ...")
+            self.env.sync()
+            self.env.close()
+        else:
+            self.env = lmdb.open(self.lmdb_dir, subdir=True,
+                                 map_size=1099511627776,
+                                 readonly=True, meminit=False, map_async=True, writemap=False)
+            with self.env.begin(write=False) as txn:
+                n_samples = pa.deserialize(txn.get(b'__len__'))
+                lengths = [pa.deserialize(txn.get('length_{}'.format(idx).encode('ascii'))) for idx in range(n_samples)]
+                # Subtract input_size from lengths and divide by hop size to determine number of starting positions
+                lengths = [(l // self.shapes["output_frames"]) + 1 for l in lengths]
+
+            self.start_pos = SortedList(np.cumsum(lengths))
+            self.length = self.start_pos[-1]
+
+    def __getitem__(self, index):
+
+        # Find out which slice of targets we want to read
+        audio_idx = self.start_pos.bisect_right(index)
+        if audio_idx > 0:
+            index = index - self.start_pos[audio_idx - 1]
+
+        with self.env.begin(write=False) as txn:
+            # Check length of audio signal
+            audio_length = pa.deserialize(txn.get('length_{}'.format(audio_idx).encode('ascii')))
+            target_length = pa.deserialize(txn.get('target_length_{}'.format(audio_idx).encode('ascii')))
+            audio = np.array(pa.deserialize(txn.get('inputs_{}'.format(audio_idx).encode('ascii')))).astype(np.float32)
+            targets = np.array(pa.deserialize(txn.get('targets_{}'.format(audio_idx).encode('ascii')))).astype(np.float32)
+
+        # Determine position where to start targets
+        if self.random_hops:
+            start_target_pos = np.random.randint(0, max(target_length - self.shapes["output_frames"] + 1, 1))
+        else:
+            # Map item index to sample position within song
+            start_target_pos = index * self.shapes["output_frames"]
+
+        # READ INPUTS
+        # Check front padding
+        start_pos = start_target_pos - self.shapes["output_start_frame"]
+        if start_pos < 0:
+            # Pad manually since audio signal was too short
+            pad_front = abs(start_pos)
+            start_pos = 0
+        else:
+            pad_front = 0
+
+        # Check back padding
+        end_pos = start_target_pos - self.shapes["output_start_frame"] + self.shapes["input_frames"]
+        if end_pos > audio_length:
+            # Pad manually since audio signal was too short
+            pad_back = end_pos - audio_length
+            end_pos = audio_length
+        else:
+            pad_back = 0
+
+        # Read and return
+        audio = audio[:, start_pos:end_pos]
+        if pad_front > 0 or pad_back > 0:
+            audio = np.pad(audio, [(0, 0), (pad_front, pad_back)], mode="constant", constant_values=0.0)
+
+        targets = targets[:, start_pos:end_pos].astype(np.float32)
+        if pad_front > 0 or pad_back > 0:
+            targets = np.pad(targets, [(0, 0), (pad_front, pad_back)], mode="constant", constant_values=0.0)
+
+        targets = {inst: targets[idx * self.channels:(idx + 1) * self.channels] for idx, inst in
+                   enumerate(self.instruments)}
 
         if hasattr(self, "audio_transform") and self.audio_transform is not None:
             audio, targets = self.audio_transform(audio, targets)
