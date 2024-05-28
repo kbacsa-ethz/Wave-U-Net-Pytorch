@@ -90,7 +90,7 @@ def main(args):
 
     print('TRAINING START')
     while state["worse_epochs"] < args.patience:
-        print("Training one epoch from iteration " + str(state["step"]))
+        print("Training at epoch {} from iteration {}".format(state["epochs"], state["step"]))
         avg_time = 0.
         model.train()
         with tqdm(total=len(train_data) // args.batch_size) as pbar:
