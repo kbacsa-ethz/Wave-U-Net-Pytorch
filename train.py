@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import model.utils as model_utils
 import utils
-from data.dataset import SeparationDatasetLMDB
+from data.dataset import SeparationDataset
 from data.musdb import get_musdb_folds
 from data.utils import crop_targets, random_amplify
 from test import evaluate, validate
@@ -54,11 +54,11 @@ def main(args):
     crop_func = partial(crop_targets, shapes=model.shapes)
     # Data augmentation function for training
     augment_func = partial(random_amplify, shapes=model.shapes, min=0.7, max=1.0)
-    train_data = SeparationDatasetLMDB(musdb, "train", args.instruments, args.sr, args.channels, model.shapes, True,
+    train_data = SeparationDataset(musdb, "train", args.instruments, args.sr, args.channels, model.shapes, True,
                                    args.hdf_dir, audio_transform=augment_func)
-    val_data = SeparationDatasetLMDB(musdb, "val", args.instruments, args.sr, args.channels, model.shapes, False,
+    val_data = SeparationDataset(musdb, "val", args.instruments, args.sr, args.channels, model.shapes, False,
                                  args.hdf_dir, audio_transform=crop_func)
-    test_data = SeparationDatasetLMDB(musdb, "test", args.instruments, args.sr, args.channels, model.shapes, False,
+    test_data = SeparationDataset(musdb, "test", args.instruments, args.sr, args.channels, model.shapes, False,
                                   args.hdf_dir, audio_transform=crop_func)
 
     dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
@@ -208,7 +208,7 @@ if __name__ == '__main__':
                         help='Folder to write logs into')
     parser.add_argument('--dataset_dir', type=str, default="/mnt/windaten/Datasets/MUSDB18HQ",
                         help='Dataset path')
-    parser.add_argument('--hdf_dir', type=str, default="lmdb",
+    parser.add_argument('--hdf_dir', type=str, default="hdf",
                         help='Dataset path')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/waveunet',
                         help='Folder to write checkpoints into')
